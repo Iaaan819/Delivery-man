@@ -71,6 +71,7 @@
   .quick.good{background:rgba(52,211,153,.12); border:1px solid var(--good); color:var(--good);}
   .quick.bad{background:rgba(248,113,113,.12); border:1px solid var(--bad); color:var(--bad);}
   .raw-ocr{margin-top:10px; background:#0b1220; border:1px solid var(--line); border-radius:10px; padding:10px; font-size:11px; color:var(--sub); white-space:pre-wrap; max-height:170px; overflow:auto; line-height:1.5;}
+  .wait-info{margin-top:2px; font-size:14px; color:var(--txt); background:var(--card2); border-radius:10px; padding:10px 12px; min-height:22px; line-height:1.5;}
 </style>
 </head>
 <body>
@@ -172,6 +173,17 @@
       <button class="gps" id="gpsBtn">📍 定位</button>
     </div>
     <div class="note">点「定位」用手机 GPS 填当前位置（需要 HTTPS 环境）。不填则默认你现在在 A 的取餐点。</div>
+  </div>
+
+  <!-- 餐馆等待时间 -->
+  <div class="card">
+    <h2>⏱ 餐馆等待时间 <span class="tag">个人数据</span></h2>
+    <div id="waitInfo" class="wait-info">上传截图识别出餐馆后，这里会显示它的平均等待时间</div>
+    <div class="inline" style="margin-top:10px;">
+      <input type="number" id="waitInput" step="0.5" min="0" placeholder="实际等了几分钟" style="flex:1;">
+      <button class="gps" id="waitSaveBtn" type="button" style="margin-left:0;">记一笔</button>
+    </div>
+    <div class="note">等待时间来自你自己的记录（平台不公开、也没现成数据）。每次取完餐填一下实际等待，越用越准。</div>
   </div>
 
   <button class="btn" id="calcBtn">🧮 计算「接不接」</button>
@@ -496,6 +508,44 @@ async function runOCR(file, statusSel){
     await worker.terminate();
   }
 }
+// —— 餐馆等待时间（个人数据库，存手机本地） ——
+let lastPickup = null;
+const WAIT_KEY = 'cc_waits';
+function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function normName(n){ return (n || '').toLowerCase().replace(/[^\w\u4e00-\u9fa5]+/g, '').trim(); }
+function getWaits(){ try { return JSON.parse(localStorage.getItem(WAIT_KEY)) || {}; } catch(e){ return {}; } }
+function saveWaits(w){ localStorage.setItem(WAIT_KEY, JSON.stringify(w)); }
+function avgWait(name){
+  const cur = getWaits()[normName(name)];
+  return (cur && cur.count > 0) ? { avg: cur.sum / cur.count, count: cur.count } : null;
+}
+function recordWait(name, minutes){
+  if (!name || !(minutes > 0)) return;
+  const w = getWaits();
+  const k = normName(name);
+  const cur = w[k] || { sum: 0, count: 0 };
+  cur.sum += minutes; cur.count += 1;
+  w[k] = cur;
+  saveWaits(w);
+  updateWaitDisplay(name);
+}
+function updateWaitDisplay(name){
+  const el = $('#waitInfo');
+  if (!name || !el) return;
+  const a = avgWait(name);
+  el.innerHTML = a
+    ? ('🍔 <b>' + esc(name) + '</b> · 平均等待 <b>' + (Math.round(a.avg * 10) / 10) + ' 分钟</b>（' + a.count + ' 次记录）')
+    : ('🍔 <b>' + esc(name) + '</b> · 暂无等待记录（取完餐后记一笔）');
+}
+$('#waitSaveBtn').addEventListener('click', () => {
+  const m = parseFloat($('#waitInput').value);
+  if (!lastPickup){ toast('先上传截图识别出餐馆，再记等待时间'); return; }
+  if (!(m > 0)){ toast('请填实际等待的分钟数'); return; }
+  recordWait(lastPickup, m);
+  $('#waitInput').value = '';
+  toast('已记录：' + lastPickup + ' 等了 ' + m + ' 分钟');
+});
+
 async function handleShot(file, target){
   if (!file) return;
   if (ocrRunning){ toast('还在识别上一张…'); return; }
@@ -517,6 +567,7 @@ async function handleShot(file, target){
     if (r.distKm != null){ $(F.dist).value = Math.round(r.distKm * 10) / 10; parts.push('距离 ' + (Math.round(r.distKm * 10) / 10) + ' km'); }
     if (r.minutes != null){ parts.push(r.minutes + ' 分钟'); }
     const pick = guessPickup(text);
+    if (pick){ lastPickup = pick; updateWaitDisplay(pick); }
     if (pick && !$(F.pickup).value.trim()){ $(F.pickup).value = pick + '（识别，请核对）'; parts.push('取餐 ' + pick); }
     st.textContent = parts.length ? ('识别到 ' + parts.join(' · ')) : '识别完成，请核对下方原文';
     const raw = $(F.raw);
@@ -536,11 +587,20 @@ function quickVerdict(r, target){
   if (r.payout == null || !(r.distKm > 0)){ qr.style.display = 'none'; return; }
   const bonus = F.bonus ? (parseFloat($('#bonusB').value) || 0) : 0;
   const th = parseFloat($('#threshold').value) || 2;
-  const perKm = (r.payout + bonus) / r.distKm;
+  const pay = r.payout + bonus;
+  const perKm = pay / r.distKm;
   const ok = perKm >= th;
   qr.style.display = 'block';
   qr.className = 'quick ' + (ok ? 'good' : 'bad');
-  qr.innerHTML = (ok ? '✅' : '❌') + ' 单价 <b>' + fmtMoney(perKm) + '/km</b>' + (ok ? '（达标，≥ ' + fmtMoney(th) + '）' : '（低于目标 ' + fmtMoney(th) + '/km）');
+  let html = (ok ? '✅' : '❌') + ' 单价 <b>' + fmtMoney(perKm) + '/km</b>' + (ok ? '（达标，≥ ' + fmtMoney(th) + '）' : '（低于目标 ' + fmtMoney(th) + '/km）');
+  if (lastPickup){
+    const wait = avgWait(lastPickup);
+    const driveMin = (r.minutes != null) ? r.minutes : (r.distKm * 3);
+    const totalMin = driveMin + (wait ? wait.avg : 0);
+    const perHr = pay / (totalMin / 60);
+    html += '<div class="hint" style="margin-top:6px;">⏱ 预计 ' + Math.round(totalMin) + ' 分钟（含等待）≈ <b>' + fmtMoney(perHr) + '/小时</b>' + (wait ? '（' + esc(lastPickup) + ' 平均等 ' + (Math.round(wait.avg * 10) / 10) + ' 分钟）' : '') + '</div>';
+  }
+  qr.innerHTML = html;
 }
 $('#shotBtn').addEventListener('click', () => $('#shotInput').click());
 $('#shotInput').addEventListener('change', e => {
